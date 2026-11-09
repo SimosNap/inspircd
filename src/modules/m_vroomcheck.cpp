@@ -123,7 +123,8 @@ private:
         Account,
         Invite,
         Start,
-        Close
+        Close,
+        SetMode
     };
 
     struct InviteRequest
@@ -152,8 +153,9 @@ private:
         InviteRequest invite = {};
         std::string starterNick = {};
         std::string starterJoined = {};
-        std::string closeConferenceId = {};
-        std::uint64_t closeRevision = 0;
+        std::string conferenceId = {};
+        std::uint64_t revision = 0;
+        std::string requestedMode = {};
     };
 
     static constexpr std::size_t MaxRoleEvents = 1024;
@@ -174,6 +176,7 @@ private:
         {
             syntax = {
                 "START <channel>",
+                "MODE <channel> <OPEN|INVITE_ONLY> <conference-id> <revision>",
                 "CLOSE <channel> <conference-id> <revision>",
                 "INVITE <channel> <nick> <conference-id> <revision>"
             };
@@ -185,6 +188,9 @@ private:
                 return module.QueueChannelCommand(user, parameters);
 
             if (irc::equals(parameters[0], "CLOSE") && parameters.size() == 4)
+                return module.QueueChannelCommand(user, parameters);
+
+            if (irc::equals(parameters[0], "MODE") && parameters.size() == 5)
                 return module.QueueChannelCommand(user, parameters);
 
             if (irc::equals(parameters[0], "INVITE") && parameters.size() == 5)
@@ -406,27 +412,48 @@ public:
             return CmdResult::FAILURE;
         }
 
-        if (closing)
+        const bool settingMode = irc::equals(parameters[0], "MODE");
+        if (closing || settingMode)
         {
+            std::string requestedMode;
+            if (settingMode)
+            {
+                if (irc::equals(parameters[2], "OPEN"))
+                    requestedMode = "OPEN";
+                else if (irc::equals(parameters[2], "INVITE_ONLY"))
+                    requestedMode = "INVITE_ONLY";
+                else
+                {
+                    user->WriteNotice("Modalità non valida. Usa OPEN oppure INVITE_ONLY.");
+                    return CmdResult::FAILURE;
+                }
+            }
+
             roleevents.push_back({
                 ++lastsequence,
                 channel->name,
                 user->uuid,
                 true,
-                VroomEventKind::Close,
+                closing ? VroomEventKind::Close : VroomEventKind::SetMode,
                 *actoraccount,
                 {},
                 user->nick,
                 joined,
                 conferenceid,
-                revision
+                revision,
+                requestedMode
             });
 
             if (roleevents.size() > MaxRoleEvents)
                 roleevents.pop_front();
 
-            user->WriteNotice("Richiesta di chiusura conferenza per {} presa in carico.",
-                channel->name);
+            if (closing)
+                user->WriteNotice("Richiesta di chiusura conferenza per {} presa in carico.",
+                    channel->name);
+            else
+                user->WriteNotice("Richiesta modalità {} per {} presa in carico.",
+                    requestedMode, channel->name);
+
             return CmdResult::SUCCESS;
         }
 
@@ -715,6 +742,7 @@ public:
                 case VroomEventKind::Invite:  kind = "invite";  break;
                 case VroomEventKind::Start:   kind = "start";   break;
                 case VroomEventKind::Close:   kind = "close";   break;
+                case VroomEventKind::SetMode: kind = "set_mode"; break;
                 default:
                     return Reject(request, 500, "unknown-event-kind");
             }
@@ -734,17 +762,22 @@ public:
                      << (event.account.empty() ? "false" : "true")
                      << ",\"account_hex\":\"" << ChannelHex(event.account) << '"';
             }
-            else if (event.kind == VroomEventKind::Start || event.kind == VroomEventKind::Close)
+            else if (event.kind == VroomEventKind::Start
+                || event.kind == VroomEventKind::Close
+                || event.kind == VroomEventKind::SetMode)
             {
                 json << ",\"actor_nick_hex\":\"" << ChannelHex(event.starterNick) << '"'
                      << ",\"actor_account_hex\":\"" << ChannelHex(event.account) << '"'
                      << ",\"actor_joined\":\"" << event.starterJoined << '"';
 
-                if (event.kind == VroomEventKind::Close)
+                if (event.kind != VroomEventKind::Start)
                 {
-                    json << ",\"conference_id_hex\":\"" << ChannelHex(event.closeConferenceId) << '"'
-                         << ",\"revision\":" << event.closeRevision;
+                    json << ",\"conference_id_hex\":\"" << ChannelHex(event.conferenceId) << '"'
+                         << ",\"revision\":" << event.revision;
                 }
+
+                if (event.kind == VroomEventKind::SetMode)
+                    json << ",\"mode\":\"" << event.requestedMode << '"';
             }
             else if (event.kind == VroomEventKind::Invite)
             {
