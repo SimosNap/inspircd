@@ -120,7 +120,23 @@ private:
         Part,
         Kick,
         Quit,
-        Account
+        Account,
+        Invite
+    };
+
+    struct InviteRequest
+    {
+        std::string actorNick;
+        std::string actorJoined;
+        std::string targetNick;
+        std::string targetAccount;
+        std::string targetSessionId;
+        std::string conferenceId;
+        std::uint64_t revision = 0;
+        bool noticeSent = false;
+        std::string noticeServer{};
+        time_t noticeStarted = 0;
+        time_t noticeLastAttempt = 0;
     };
 
     struct VroomEvent
@@ -131,6 +147,7 @@ private:
         bool isop;
         VroomEventKind kind = VroomEventKind::Role;
         std::string account = {};
+        InviteRequest invite = {};
     };
 
     static constexpr std::size_t MaxRoleEvents = 1024;
@@ -138,6 +155,102 @@ private:
     std::uint64_t lastsequence = 0;
     const std::string eventepoch = ServerInstance->GenRandomStr(32);
     CommandVroomCheck command;
+
+    class CommandVroom final : public Command
+    {
+    private:
+        ModuleVroomCheck& module;
+
+    public:
+        explicit CommandVroom(ModuleVroomCheck* parent)
+            : Command(parent, "VROOM", 5, 5)
+            , module(*parent)
+        {
+            syntax = { "INVITE <channel> <nick> <conference-id> <revision>" };
+        }
+
+        CmdResult Handle(User* user, const Params& parameters) override
+        {
+            if (!irc::equals(parameters[0], "INVITE"))
+            {
+                user->WriteNotice("Uso: VROOM INVITE <canale> <nick> <id-conferenza> <revisione>");
+                return CmdResult::FAILURE;
+            }
+
+            return module.QueueInvite(user, parameters[1], parameters[2],
+                parameters[3], parameters[4]);
+        }
+    };
+
+    CommandVroom vroomcommand{this};
+
+    class CommandVroomNotice final : public Command
+    {
+    private:
+        ModuleVroomCheck& module;
+
+    public:
+        explicit CommandVroomNotice(ModuleVroomCheck* parent)
+            : Command(parent, "VROOMNOTICE", 6, 6)
+            , module(*parent)
+        {
+        }
+
+        CmdResult Handle(User* source, const Params& parameters) override
+        {
+            if (!IS_SERVER(source))
+                return CmdResult::FAILURE;
+
+            return module.ReceiveInviteNotice(source, parameters);
+        }
+    };
+
+    CommandVroomNotice vroomnoticecommand{this};
+
+    class CommandVroomNoticeAck final : public Command
+    {
+    private:
+        ModuleVroomCheck& module;
+
+    public:
+        explicit CommandVroomNoticeAck(ModuleVroomCheck* parent)
+            : Command(parent, "VROOMNOTICEACK", 3, 3)
+            , module(*parent)
+        {
+        }
+
+        CmdResult Handle(User* source, const Params& parameters) override
+        {
+            // Parametri: epoch del mittente, sequenza invito, UUID destinatario.
+            if (!IS_SERVER(source) || parameters[0] != module.eventepoch)
+                return CmdResult::FAILURE;
+
+            std::uint64_t seq = 0;
+            if (!module.ParseCursor(parameters[1], seq) || !seq)
+                return CmdResult::FAILURE;
+
+            for (auto& event : module.roleevents)
+            {
+                if (event.sequence != seq)
+                    continue;
+
+                auto& invite = event.invite;
+                if (event.kind != VroomEventKind::Invite
+                    || invite.noticeServer.empty()
+                    || !irc::equals(invite.noticeServer, source->server->GetName())
+                    || invite.targetSessionId != parameters[2])
+                    return CmdResult::FAILURE;
+
+                invite.noticeSent = true;
+                return CmdResult::SUCCESS;
+            }
+
+            return CmdResult::FAILURE;
+        }
+    };
+
+    CommandVroomNoticeAck vroomnoticeackcommand{this};
+
     HTTPdAPI httpapi;
     Account::API accountapi;
 
@@ -202,6 +315,87 @@ public:
             else
                 ++it;
         }
+    }
+
+    CmdResult QueueInvite(User* user, const std::string& channelname,
+        const std::string& targetnick, const std::string& conferenceid,
+        const std::string& revisiontext)
+    {
+        if (!IS_LOCAL(user))
+            return CmdResult::FAILURE;
+
+        if (enabledchannels.find(channelname) == enabledchannels.end())
+        {
+            user->WriteNotice("Conferenze disabilitate su questo canale.");
+            return CmdResult::FAILURE;
+        }
+
+        auto* channel = ServerInstance->Channels.Find(channelname);
+        auto* membership = channel ? channel->GetUser(user) : nullptr;
+        if (!membership || !IsChannelOp(membership->GetAllPrefixModes()))
+        {
+            user->WriteNotice("Devi essere op del canale per invitare.");
+            return CmdResult::FAILURE;
+        }
+
+        if (!accountapi)
+        {
+            user->WriteNotice("API account non disponibile su questo server.");
+            return CmdResult::FAILURE;
+        }
+
+        const auto* actoraccount = accountapi->GetAccountName(user);
+        if (!actoraccount || actoraccount->empty() || *actoraccount == "*")
+        {
+            user->WriteNotice("Devi essere autenticato per invitare.");
+            return CmdResult::FAILURE;
+        }
+
+        const auto joined = GetJoinTime(membership);
+        if (!IsJoinTime(joined))
+        {
+            user->WriteNotice("Join-time EXTJWT non disponibile per questa presenza.");
+            return CmdResult::FAILURE;
+        }
+
+        std::uint64_t revision = 0;
+        if (conferenceid.empty() || conferenceid.size() > 128 ||
+            !ParseCursor(revisiontext, revision) || revision == 0)
+        {
+            user->WriteNotice("Identificativo o revisione della conferenza non validi.");
+            return CmdResult::FAILURE;
+        }
+
+        auto* target = ServerInstance->Users.FindNick(targetnick, true);
+        if (!target)
+        {
+            user->WriteNotice("Il destinatario non è connesso.");
+            return CmdResult::FAILURE;
+        }
+
+        const auto* targetaccount = accountapi->GetAccountName(target);
+        if (!targetaccount || targetaccount->empty() || *targetaccount == "*")
+        {
+            user->WriteNotice("Il destinatario deve essere autenticato per ricevere l'invito.");
+            return CmdResult::FAILURE;
+        }
+
+        roleevents.push_back({
+            ++lastsequence,
+            channel->name,
+            user->uuid,
+            true,
+            VroomEventKind::Invite,
+            *actoraccount,
+            {user->nick, joined, target->nick, *targetaccount,
+                target->uuid, conferenceid, revision}
+        });
+
+        if (roleevents.size() > MaxRoleEvents)
+            roleevents.pop_front();
+
+        user->WriteNotice("Richiesta di invito per {} presa in carico.", target->nick);
+        return CmdResult::SUCCESS;
     }
 
     void LogDeparture(Membership* membership, VroomEventKind kind)
@@ -447,11 +641,12 @@ public:
             const char* kind;
             switch (event.kind)
             {
-                case VroomEventKind::Role: kind = "role"; break;
-                case VroomEventKind::Part: kind = "part"; break;
-                case VroomEventKind::Kick: kind = "kick"; break;
-                case VroomEventKind::Quit: kind = "quit"; break;
+                case VroomEventKind::Role:    kind = "role";    break;
+                case VroomEventKind::Part:    kind = "part";    break;
+                case VroomEventKind::Kick:    kind = "kick";    break;
+                case VroomEventKind::Quit:    kind = "quit";    break;
                 case VroomEventKind::Account: kind = "account"; break;
+                case VroomEventKind::Invite:  kind = "invite";  break;
                 default:
                     return Reject(request, 500, "unknown-event-kind");
             }
@@ -471,6 +666,18 @@ public:
                      << (event.account.empty() ? "false" : "true")
                      << ",\"account_hex\":\"" << ChannelHex(event.account) << '"';
             }
+            else if (event.kind == VroomEventKind::Invite)
+            {
+                const auto& invite = event.invite;
+                json << ",\"actor_nick_hex\":\"" << ChannelHex(invite.actorNick) << '"'
+                     << ",\"actor_account_hex\":\"" << ChannelHex(event.account) << '"'
+                     << ",\"actor_joined\":\"" << invite.actorJoined << '"'
+                     << ",\"target_nick_hex\":\"" << ChannelHex(invite.targetNick) << '"'
+                     << ",\"target_account_hex\":\"" << ChannelHex(invite.targetAccount) << '"'
+                     << ",\"target_session_id_hex\":\"" << ChannelHex(invite.targetSessionId) << '"'
+                     << ",\"conference_id_hex\":\"" << ChannelHex(invite.conferenceId) << '"'
+                     << ",\"revision\":" << invite.revision;
+            }
 
             json << '}';
 
@@ -483,10 +690,192 @@ public:
         return SendJson(request, 200, json.str());
     }
 
+    static bool DecodeNoticeField(const std::string& hex, std::string& value)
+    {
+        if (hex.empty() || hex.size() % 2 != 0)
+            return false;
+
+        auto digit = [](char ch) -> int
+        {
+            if (ch >= '0' && ch <= '9')
+                return ch - '0';
+            if (ch >= 'a' && ch <= 'f')
+                return ch - 'a' + 10;
+            return -1;
+        };
+
+        value.clear();
+        value.reserve(hex.size() / 2);
+        for (std::size_t pos = 0; pos < hex.size(); pos += 2)
+        {
+            const int high = digit(hex[pos]);
+            const int low = digit(hex[pos + 1]);
+            if (high < 0 || low < 0)
+                return false;
+
+            const int byte = high * 16 + low;
+            if (byte <= 0x20 || byte == 0x7f)
+                return false;
+
+            value.push_back(static_cast<char>(byte));
+        }
+        return true;
+    }
+
+    struct DeliveredNotice
+    {
+        std::string targetSessionId;
+        time_t expires;
+    };
+
+    std::map<std::string, DeliveredNotice> deliveredNotices;
+
+    CmdResult ReceiveInviteNotice(User* source, const CommandBase::Params& parameters)
+    {
+        // epoch, seq, UUID destinatario, account hex, canale hex, nick autore hex
+        std::uint64_t seq = 0;
+        if (!IS_SERVER(source) || parameters.size() != 6
+            || parameters[0].size() != 32
+            || !ParseCursor(parameters[1], seq) || !seq)
+            return CmdResult::FAILURE;
+
+        const auto& origin = source->server->GetName();
+        const auto now = ServerInstance->Time();
+        const std::string key = origin + "/" + parameters[0] + "/" + std::to_string(seq);
+
+        for (auto it = deliveredNotices.begin(); it != deliveredNotices.end(); )
+        {
+            if (it->second.expires <= now)
+                it = deliveredNotices.erase(it);
+            else
+                ++it;
+        }
+
+        const auto acknowledge = [&]()
+        {
+            CommandBase::Params ack;
+            ack.push_back(parameters[0]);
+            ack.push_back(parameters[1]);
+            ack.push_back(parameters[2]);
+            return ServerInstance->PI->SendEncapsulatedData(origin, "VROOMNOTICEACK", ack);
+        };
+
+        const auto previous = deliveredNotices.find(key);
+        if (previous != deliveredNotices.end())
+        {
+            if (previous->second.targetSessionId != parameters[2])
+                return CmdResult::FAILURE;
+
+            return acknowledge() ? CmdResult::SUCCESS : CmdResult::FAILURE;
+        }
+
+        // Manteniamo le conferme ancora valide anche quando la cache è piena.
+        if (deliveredNotices.size() >= MaxRoleEvents)
+            return CmdResult::FAILURE;
+
+        std::string channelname;
+        std::string actornick;
+        if (!DecodeNoticeField(parameters[4], channelname)
+            || !DecodeNoticeField(parameters[5], actornick)
+            || enabledchannels.find(channelname) == enabledchannels.end())
+            return CmdResult::FAILURE;
+
+        auto* channel = ServerInstance->Channels.Find(channelname);
+        auto* actor = ServerInstance->Users.FindNick(actornick, true);
+        if (!channel || !actor || actor->server != source->server)
+            return CmdResult::FAILURE;
+
+        auto* membership = channel->GetUser(actor);
+        if (!membership || !IsChannelOp(membership->GetAllPrefixModes()))
+            return CmdResult::FAILURE;
+
+        auto* target = ServerInstance->Users.FindUUID<LocalUser>(parameters[2], true);
+        if (!target || !accountapi)
+            return CmdResult::FAILURE;
+
+        const auto* account = accountapi->GetAccountName(target);
+        if (!account || account->empty() || *account == "*"
+            || ChannelHex(*account) != parameters[3])
+            return CmdResult::FAILURE;
+
+        target->WriteNotice("{} ti invita alla conferenza di {}. Apri VRoom nel canale.",
+            actor->nick, channel->name);
+
+        deliveredNotices.emplace(key, DeliveredNotice{target->uuid, now + 120});
+        return acknowledge() ? CmdResult::SUCCESS : CmdResult::FAILURE;
+    }
+
+    bool ForwardInviteNotice(const std::string& targetserver, const VroomEvent& event)
+    {
+        const auto& invite = event.invite;
+
+        CommandBase::Params params;
+        params.push_back(eventepoch);
+        params.push_back(std::to_string(event.sequence));
+        params.push_back(invite.targetSessionId);
+        params.push_back(ChannelHex(invite.targetAccount));
+        params.push_back(ChannelHex(event.channel));
+        params.push_back(ChannelHex(invite.actorNick));
+
+        return ServerInstance->PI->SendEncapsulatedData(
+            targetserver, "VROOMNOTICE", params);
+    }
+
     ModResult OnHTTPRequest(HTTPRequest& request) override
     {
         if (request.GetPath() == "/vroom/events")
             return ReadEvents(request);
+
+        if (request.GetPath() == "/vroom/invite-notice")
+        {
+            if (request.GetIP() != "127.0.0.1")
+                return Reject(request, 403, "local-only");
+
+            if (request.GetType() != "POST")
+                return Reject(request, 405, "post-required");
+
+            if (request.headers->GetHeader("X-Vroom-Epoch") != eventepoch)
+                return Reject(request, 409, "epoch-mismatch");
+
+            std::uint64_t seq = 0;
+            if (!ParseCursor(request.headers->GetHeader("X-Vroom-Seq"), seq) || !seq)
+                return Reject(request, 400, "invalid-sequence");
+
+            for (auto& event : roleevents)
+            {
+                if (event.sequence != seq)
+                    continue;
+
+                if (event.kind != VroomEventKind::Invite)
+                    return Reject(request, 409, "not-an-invite");
+
+                auto& invite = event.invite;
+                if (invite.noticeSent)
+                    return SendJson(request, 200, "{\"result\":\"already-sent\"}");
+
+                if (enabledchannels.find(event.channel) == enabledchannels.end())
+                    return Reject(request, 403, "channel-disabled");
+
+                auto* target = ServerInstance->Users.FindNick<LocalUser>(invite.targetNick, true);
+                if (!target || target->uuid != invite.targetSessionId)
+                    return Reject(request, 409, "target-session-changed");
+
+                if (!accountapi)
+                    return Reject(request, 503, "account-api-unavailable");
+
+                const auto* account = accountapi->GetAccountName(target);
+                if (!account || account->empty() || *account == "*" ||
+                    *account != invite.targetAccount)
+                    return Reject(request, 403, "target-account-mismatch");
+
+                target->WriteNotice("{} ti invita alla conferenza di {}. Apri VRoom nel canale.",
+                    invite.actorNick, event.channel);
+                invite.noticeSent = true;
+                return SendJson(request, 200, "{\"result\":\"sent\"}");
+            }
+
+            return Reject(request, 404, "invite-event-unavailable");
+        }
 
         if (request.GetPath() != "/vroom/check")
             return MOD_RES_PASSTHRU;
