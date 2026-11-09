@@ -121,7 +121,8 @@ private:
         Kick,
         Quit,
         Account,
-        Invite
+        Invite,
+        Start
     };
 
     struct InviteRequest
@@ -148,6 +149,8 @@ private:
         VroomEventKind kind = VroomEventKind::Role;
         std::string account = {};
         InviteRequest invite = {};
+        std::string starterNick = {};
+        std::string starterJoined = {};
     };
 
     static constexpr std::size_t MaxRoleEvents = 1024;
@@ -163,22 +166,26 @@ private:
 
     public:
         explicit CommandVroom(ModuleVroomCheck* parent)
-            : Command(parent, "VROOM", 5, 5)
+            : Command(parent, "VROOM", 2, 5)
             , module(*parent)
         {
-            syntax = { "INVITE <channel> <nick> <conference-id> <revision>" };
+            syntax = {
+                "START <channel>",
+                "INVITE <channel> <nick> <conference-id> <revision>"
+            };
         }
 
         CmdResult Handle(User* user, const Params& parameters) override
         {
-            if (!irc::equals(parameters[0], "INVITE"))
-            {
-                user->WriteNotice("Uso: VROOM INVITE <canale> <nick> <id-conferenza> <revisione>");
-                return CmdResult::FAILURE;
-            }
+            if (irc::equals(parameters[0], "START") && parameters.size() == 2)
+                return module.QueueChannelCommand(user, parameters);
 
-            return module.QueueInvite(user, parameters[1], parameters[2],
-                parameters[3], parameters[4]);
+            if (irc::equals(parameters[0], "INVITE") && parameters.size() == 5)
+                return module.QueueChannelCommand(user, parameters);
+
+            user->WriteNotice("Uso: VROOM START <canale> oppure "
+                "VROOM INVITE <canale> <nick> <id-conferenza> <revisione>");
+            return CmdResult::FAILURE;
         }
     };
 
@@ -317,10 +324,9 @@ public:
         }
     }
 
-    CmdResult QueueInvite(User* user, const std::string& channelname,
-        const std::string& targetnick, const std::string& conferenceid,
-        const std::string& revisiontext)
+    CmdResult QueueChannelCommand(User* user, const CommandBase::Params& parameters)
     {
+        const auto& channelname = parameters[1];
         if (!IS_LOCAL(user))
             return CmdResult::FAILURE;
 
@@ -334,7 +340,7 @@ public:
         auto* membership = channel ? channel->GetUser(user) : nullptr;
         if (!membership || !IsChannelOp(membership->GetAllPrefixModes()))
         {
-            user->WriteNotice("Devi essere op del canale per invitare.");
+            user->WriteNotice("Devi essere op del canale per usare questo comando.");
             return CmdResult::FAILURE;
         }
 
@@ -347,7 +353,7 @@ public:
         const auto* actoraccount = accountapi->GetAccountName(user);
         if (!actoraccount || actoraccount->empty() || *actoraccount == "*")
         {
-            user->WriteNotice("Devi essere autenticato per invitare.");
+            user->WriteNotice("Devi essere autenticato per usare questo comando.");
             return CmdResult::FAILURE;
         }
 
@@ -357,6 +363,32 @@ public:
             user->WriteNotice("Join-time EXTJWT non disponibile per questa presenza.");
             return CmdResult::FAILURE;
         }
+
+        if (irc::equals(parameters[0], "START"))
+        {
+            roleevents.push_back({
+                ++lastsequence,
+                channel->name,
+                user->uuid,
+                true,
+                VroomEventKind::Start,
+                *actoraccount,
+                {},
+                user->nick,
+                joined
+            });
+
+            if (roleevents.size() > MaxRoleEvents)
+                roleevents.pop_front();
+
+            user->WriteNotice("Richiesta di avvio conferenza per {} presa in carico.",
+                channel->name);
+            return CmdResult::SUCCESS;
+        }
+
+        const auto& targetnick = parameters[2];
+        const auto& conferenceid = parameters[3];
+        const auto& revisiontext = parameters[4];
 
         std::uint64_t revision = 0;
         if (conferenceid.empty() || conferenceid.size() > 128 ||
@@ -647,6 +679,7 @@ public:
                 case VroomEventKind::Quit:    kind = "quit";    break;
                 case VroomEventKind::Account: kind = "account"; break;
                 case VroomEventKind::Invite:  kind = "invite";  break;
+                case VroomEventKind::Start:   kind = "start";   break;
                 default:
                     return Reject(request, 500, "unknown-event-kind");
             }
@@ -665,6 +698,12 @@ public:
                 json << ",\"authenticated\":"
                      << (event.account.empty() ? "false" : "true")
                      << ",\"account_hex\":\"" << ChannelHex(event.account) << '"';
+            }
+            else if (event.kind == VroomEventKind::Start)
+            {
+                json << ",\"actor_nick_hex\":\"" << ChannelHex(event.starterNick) << '"'
+                     << ",\"actor_account_hex\":\"" << ChannelHex(event.account) << '"'
+                     << ",\"actor_joined\":\"" << event.starterJoined << '"';
             }
             else if (event.kind == VroomEventKind::Invite)
             {
