@@ -122,7 +122,8 @@ private:
         Quit,
         Account,
         Invite,
-        Start
+        Start,
+        Close
     };
 
     struct InviteRequest
@@ -151,6 +152,8 @@ private:
         InviteRequest invite = {};
         std::string starterNick = {};
         std::string starterJoined = {};
+        std::string closeConferenceId = {};
+        std::uint64_t closeRevision = 0;
     };
 
     static constexpr std::size_t MaxRoleEvents = 1024;
@@ -171,6 +174,7 @@ private:
         {
             syntax = {
                 "START <channel>",
+                "CLOSE <channel> <conference-id> <revision>",
                 "INVITE <channel> <nick> <conference-id> <revision>"
             };
         }
@@ -180,10 +184,14 @@ private:
             if (irc::equals(parameters[0], "START") && parameters.size() == 2)
                 return module.QueueChannelCommand(user, parameters);
 
+            if (irc::equals(parameters[0], "CLOSE") && parameters.size() == 4)
+                return module.QueueChannelCommand(user, parameters);
+
             if (irc::equals(parameters[0], "INVITE") && parameters.size() == 5)
                 return module.QueueChannelCommand(user, parameters);
 
-            user->WriteNotice("Uso: VROOM START <canale> oppure "
+            user->WriteNotice("Uso: VROOM START <canale>, "
+                "VROOM CLOSE <canale> <id-conferenza> <revisione> oppure "
                 "VROOM INVITE <canale> <nick> <id-conferenza> <revisione>");
             return CmdResult::FAILURE;
         }
@@ -386,9 +394,9 @@ public:
             return CmdResult::SUCCESS;
         }
 
-        const auto& targetnick = parameters[2];
-        const auto& conferenceid = parameters[3];
-        const auto& revisiontext = parameters[4];
+        const bool closing = irc::equals(parameters[0], "CLOSE");
+        const auto& conferenceid = parameters[closing ? 2 : 3];
+        const auto& revisiontext = parameters[closing ? 3 : 4];
 
         std::uint64_t revision = 0;
         if (conferenceid.empty() || conferenceid.size() > 128 ||
@@ -397,6 +405,32 @@ public:
             user->WriteNotice("Identificativo o revisione della conferenza non validi.");
             return CmdResult::FAILURE;
         }
+
+        if (closing)
+        {
+            roleevents.push_back({
+                ++lastsequence,
+                channel->name,
+                user->uuid,
+                true,
+                VroomEventKind::Close,
+                *actoraccount,
+                {},
+                user->nick,
+                joined,
+                conferenceid,
+                revision
+            });
+
+            if (roleevents.size() > MaxRoleEvents)
+                roleevents.pop_front();
+
+            user->WriteNotice("Richiesta di chiusura conferenza per {} presa in carico.",
+                channel->name);
+            return CmdResult::SUCCESS;
+        }
+
+        const auto& targetnick = parameters[2];
 
         auto* target = ServerInstance->Users.FindNick(targetnick, true);
         if (!target)
@@ -680,6 +714,7 @@ public:
                 case VroomEventKind::Account: kind = "account"; break;
                 case VroomEventKind::Invite:  kind = "invite";  break;
                 case VroomEventKind::Start:   kind = "start";   break;
+                case VroomEventKind::Close:   kind = "close";   break;
                 default:
                     return Reject(request, 500, "unknown-event-kind");
             }
@@ -699,11 +734,17 @@ public:
                      << (event.account.empty() ? "false" : "true")
                      << ",\"account_hex\":\"" << ChannelHex(event.account) << '"';
             }
-            else if (event.kind == VroomEventKind::Start)
+            else if (event.kind == VroomEventKind::Start || event.kind == VroomEventKind::Close)
             {
                 json << ",\"actor_nick_hex\":\"" << ChannelHex(event.starterNick) << '"'
                      << ",\"actor_account_hex\":\"" << ChannelHex(event.account) << '"'
                      << ",\"actor_joined\":\"" << event.starterJoined << '"';
+
+                if (event.kind == VroomEventKind::Close)
+                {
+                    json << ",\"conference_id_hex\":\"" << ChannelHex(event.closeConferenceId) << '"'
+                         << ",\"revision\":" << event.closeRevision;
+                }
             }
             else if (event.kind == VroomEventKind::Invite)
             {
