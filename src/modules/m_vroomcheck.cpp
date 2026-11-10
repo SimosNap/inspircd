@@ -156,6 +156,7 @@ private:
         std::string conferenceId = {};
         std::uint64_t revision = 0;
         std::string requestedMode = {};
+        bool expiredNoticeSent = false;
     };
 
     static constexpr std::size_t MaxRoleEvents = 1024;
@@ -938,6 +939,54 @@ public:
     {
         if (request.GetPath() == "/vroom/events")
             return ReadEvents(request);
+
+        if (request.GetPath() == "/vroom/start-expired")
+        {
+            if (request.GetIP() != "127.0.0.1")
+                return Reject(request, 403, "local-only");
+
+            if (request.GetType() != "POST")
+                return Reject(request, 405, "post-required");
+
+            if (request.headers->GetHeader("X-Vroom-Epoch") != eventepoch)
+                return Reject(request, 409, "epoch-mismatch");
+
+            std::uint64_t seq = 0;
+            if (!ParseCursor(request.headers->GetHeader("X-Vroom-Seq"), seq) || !seq)
+                return Reject(request, 400, "invalid-sequence");
+
+            for (auto& event : roleevents)
+            {
+                if (event.sequence != seq)
+                    continue;
+
+                if (event.kind != VroomEventKind::Start)
+                    return Reject(request, 409, "not-a-start");
+
+                if (event.expiredNoticeSent)
+                    return SendJson(request, 200, "{\"result\":\"already-sent\"}");
+
+                auto* target = ServerInstance->Users.FindUUID<LocalUser>(event.sessionid, true);
+                if (!target)
+                    return Reject(request, 409, "target-session-changed");
+
+                if (!accountapi)
+                    return Reject(request, 503, "account-api-unavailable");
+
+                const auto* account = accountapi->GetAccountName(target);
+                if (!account || account->empty() || *account == "*" || *account != event.account)
+                    return Reject(request, 403, "target-account-mismatch");
+
+                target->WriteNotice("La richiesta di avvio per {} è scaduta mentre VRoom "
+                    "era offline. Per aprire la conferenza, ripeti VROOM START {}.",
+                    event.channel, event.channel);
+
+                event.expiredNoticeSent = true;
+                return SendJson(request, 200, "{\"result\":\"sent\"}");
+            }
+
+            return Reject(request, 404, "start-event-unavailable");
+        }
 
         if (request.GetPath() == "/vroom/invite-notice")
         {
