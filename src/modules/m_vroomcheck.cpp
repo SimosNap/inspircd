@@ -110,6 +110,25 @@ class ModuleVroomCheck final
 {
 private:
     VroomChannels enabledchannels;
+    class VroomActiveMode final : public SimpleChannelMode
+    {
+    public:
+        explicit VroomActiveMode(Module* parent)
+            : SimpleChannelMode(parent, "vroomactive", 'V')
+        {
+        }
+
+        bool OnModeChange(User* source, User* dest, Channel* channel,
+            Modes::Change& change) override
+        {
+            if (!IS_SERVER(source))
+                return false;
+
+            return SimpleChannelMode::OnModeChange(source, dest, channel, change);
+        }
+    };
+
+    VroomActiveMode vroomActiveMode{this};
     // Canale -> UUID della connessione -> ultimo account osservato.
     // Una stringa vuota rappresenta un logout.
     using SessionAccounts = std::map<std::string, std::string>;
@@ -939,6 +958,56 @@ public:
     {
         if (request.GetPath() == "/vroom/events")
             return ReadEvents(request);
+
+        if (request.GetPath() == "/vroom/active")
+        {
+            if (request.GetIP() != "127.0.0.1")
+                return Reject(request, 403, "local-only");
+
+            if (request.GetType() != "POST")
+                return Reject(request, 405, "post-required");
+
+            if (request.headers->GetHeader("X-Vroom-Epoch") != eventepoch)
+                return Reject(request, 409, "epoch-mismatch");
+
+            const auto channelname = request.headers->GetHeader("X-Vroom-Channel");
+            if (enabledchannels.find(channelname) == enabledchannels.end())
+                return Reject(request, 403, "channel-disabled");
+
+            const auto value = request.headers->GetHeader("X-Vroom-Active");
+            if (value != "0" && value != "1")
+                return Reject(request, 400, "invalid-active-value");
+
+            const bool active = (value == "1");
+            auto* channel = ServerInstance->Channels.Find(channelname);
+
+            if (!channel)
+            {
+                if (active)
+                    return Reject(request, 404, "channel-not-found");
+
+                return SendJson(request, 200, "{\"result\":\"ok\",\"active\":false}");
+            }
+
+            if (channel->IsModeSet(&vroomActiveMode) != active)
+            {
+                Modes::ChangeList changes;
+                if (active)
+                    changes.push_add(&vroomActiveMode);
+                else
+                    changes.push_remove(&vroomActiveMode);
+
+                ServerInstance->Modes.Process(
+                    ServerInstance->FakeClient, channel, nullptr, changes);
+
+                if (channel->IsModeSet(&vroomActiveMode) != active)
+                    return Reject(request, 503, "mode-change-failed");
+            }
+
+            return SendJson(request, 200, active
+                ? "{\"result\":\"ok\",\"active\":true}"
+                : "{\"result\":\"ok\",\"active\":false}");
+        }
 
         if (request.GetPath() == "/vroom/start-expired")
         {
