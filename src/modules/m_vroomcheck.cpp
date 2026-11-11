@@ -143,7 +143,8 @@ private:
         Invite,
         Start,
         Close,
-        SetMode
+        SetMode,
+        Status
     };
 
     struct InviteRequest
@@ -176,6 +177,7 @@ private:
         std::uint64_t revision = 0;
         std::string requestedMode = {};
         bool expiredNoticeSent = false;
+        bool statusReplySent = false;
     };
 
     static constexpr std::size_t MaxRoleEvents = 1024;
@@ -195,6 +197,7 @@ private:
             , module(*parent)
         {
             syntax = {
+                "STATUS <channel>",
                 "START <channel>",
                 "MODE <channel> <OPEN|INVITE_ONLY> <conference-id> <revision>",
                 "CLOSE <channel> <conference-id> <revision>",
@@ -204,6 +207,9 @@ private:
 
         CmdResult Handle(User* user, const Params& parameters) override
         {
+            if (irc::equals(parameters[0], "STATUS") && parameters.size() == 2)
+                return module.QueueChannelCommand(user, parameters);
+
             if (irc::equals(parameters[0], "START") && parameters.size() == 2)
                 return module.QueueChannelCommand(user, parameters);
 
@@ -216,7 +222,8 @@ private:
             if (irc::equals(parameters[0], "INVITE") && parameters.size() == 5)
                 return module.QueueChannelCommand(user, parameters);
 
-            user->WriteNotice("Uso: VROOM START <canale>, "
+            user->WriteNotice("Uso: VROOM STATUS <canale>, VROOM START <canale>, "
+                "VROOM MODE <canale> <OPEN|INVITE_ONLY> <id-conferenza> <revisione>, "
                 "VROOM CLOSE <canale> <id-conferenza> <revisione> oppure "
                 "VROOM INVITE <canale> <nick> <id-conferenza> <revisione>");
             return CmdResult::FAILURE;
@@ -398,14 +405,15 @@ public:
             return CmdResult::FAILURE;
         }
 
-        if (irc::equals(parameters[0], "START"))
+        const bool statusRequested = irc::equals(parameters[0], "STATUS");
+        if (statusRequested || irc::equals(parameters[0], "START"))
         {
             roleevents.push_back({
                 ++lastsequence,
                 channel->name,
                 user->uuid,
                 true,
-                VroomEventKind::Start,
+                statusRequested ? VroomEventKind::Status : VroomEventKind::Start,
                 *actoraccount,
                 {},
                 user->nick,
@@ -415,8 +423,11 @@ public:
             if (roleevents.size() > MaxRoleEvents)
                 roleevents.pop_front();
 
-            user->WriteNotice("Richiesta di avvio conferenza per {} presa in carico.",
-                channel->name);
+            if (!statusRequested)
+            {
+                user->WriteNotice("Richiesta di avvio conferenza per {} presa in carico.",
+                    channel->name);
+            }
             return CmdResult::SUCCESS;
         }
 
@@ -761,6 +772,7 @@ public:
                 case VroomEventKind::Account: kind = "account"; break;
                 case VroomEventKind::Invite:  kind = "invite";  break;
                 case VroomEventKind::Start:   kind = "start";   break;
+                case VroomEventKind::Status:  kind = "status";  break;
                 case VroomEventKind::Close:   kind = "close";   break;
                 case VroomEventKind::SetMode: kind = "set_mode"; break;
                 default:
@@ -783,6 +795,7 @@ public:
                      << ",\"account_hex\":\"" << ChannelHex(event.account) << '"';
             }
             else if (event.kind == VroomEventKind::Start
+                || event.kind == VroomEventKind::Status
                 || event.kind == VroomEventKind::Close
                 || event.kind == VroomEventKind::SetMode)
             {
@@ -790,7 +803,7 @@ public:
                      << ",\"actor_account_hex\":\"" << ChannelHex(event.account) << '"'
                      << ",\"actor_joined\":\"" << event.starterJoined << '"';
 
-                if (event.kind != VroomEventKind::Start)
+                if (event.kind == VroomEventKind::Close || event.kind == VroomEventKind::SetMode)
                 {
                     json << ",\"conference_id_hex\":\"" << ChannelHex(event.conferenceId) << '"'
                          << ",\"revision\":" << event.revision;
@@ -1007,6 +1020,91 @@ public:
             return SendJson(request, 200, active
                 ? "{\"result\":\"ok\",\"active\":true}"
                 : "{\"result\":\"ok\",\"active\":false}");
+        }
+
+        if (request.GetPath() == "/vroom/status-reply")
+        {
+            if (request.GetIP() != "127.0.0.1")
+                return Reject(request, 403, "local-only");
+
+            if (request.GetType() != "POST")
+                return Reject(request, 405, "post-required");
+
+            if (request.headers->GetHeader("X-Vroom-Epoch") != eventepoch)
+                return Reject(request, 409, "epoch-mismatch");
+
+            std::uint64_t seq = 0;
+            if (!ParseCursor(request.headers->GetHeader("X-Vroom-Seq"), seq) || !seq)
+                return Reject(request, 400, "invalid-sequence");
+
+            for (auto& event : roleevents)
+            {
+                if (event.sequence != seq)
+                    continue;
+
+                if (event.kind != VroomEventKind::Status)
+                    return Reject(request, 409, "not-a-status");
+
+                if (event.statusReplySent)
+                    return SendJson(request, 200, "{\"result\":\"already-sent\"}");
+
+                const auto state = request.headers->GetHeader("X-Vroom-Status");
+                const auto mode = request.headers->GetHeader("X-Vroom-Mode");
+                const auto cid = request.headers->GetHeader("X-Vroom-Conference-Id");
+
+                if (state != "CLOSED" && state != "STARTING" &&
+                    state != "ACTIVE" && state != "CLOSING")
+                    return Reject(request, 400, "invalid-status");
+
+                if (mode != "OPEN" && mode != "INVITE_ONLY")
+                    return Reject(request, 400, "invalid-mode");
+
+                std::uint64_t revision = 0;
+                if (!ParseCursor(request.headers->GetHeader("X-Vroom-Revision"), revision))
+                    return Reject(request, 400, "invalid-revision");
+
+                // Il ponte usa "-" per una stanza mai avviata.
+                if (cid == "-")
+                {
+                    if (state != "CLOSED" || revision != 0)
+                        return Reject(request, 400, "invalid-conference");
+                }
+                else if (cid.empty() || cid.size() > 128 || revision == 0 ||
+                    cid.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                        "abcdefghijklmnopqrstuvwxyz0123456789_-") != std::string::npos)
+                {
+                    return Reject(request, 400, "invalid-conference");
+                }
+
+                if (enabledchannels.find(event.channel) == enabledchannels.end())
+                    return Reject(request, 403, "channel-disabled");
+
+                auto* target = ServerInstance->Users.FindUUID<LocalUser>(event.sessionid, true);
+                if (!target)
+                    return Reject(request, 409, "target-session-changed");
+
+                if (!accountapi)
+                    return Reject(request, 503, "account-api-unavailable");
+
+                const auto* account = accountapi->GetAccountName(target);
+                if (!account || *account != event.account)
+                    return Reject(request, 403, "target-account-mismatch");
+
+                auto* channel = ServerInstance->Channels.Find(event.channel);
+                auto* membership = channel ? channel->GetUser(target) : nullptr;
+                if (!membership || GetJoinTime(membership) != event.starterJoined)
+                    return Reject(request, 409, "target-membership-changed");
+
+                if (!IsChannelOp(membership->GetAllPrefixModes()))
+                    return Reject(request, 403, "channel-op-required");
+
+                target->WriteNotice("VROOM STATUS {} {} {} {} {}",
+                    channel->name, state, mode, cid, revision);
+                event.statusReplySent = true;
+                return SendJson(request, 200, "{\"result\":\"sent\"}");
+            }
+
+            return Reject(request, 404, "status-event-unavailable");
         }
 
         if (request.GetPath() == "/vroom/start-expired")
