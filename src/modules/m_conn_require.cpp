@@ -23,7 +23,11 @@
 /// $ModDesc: Allow or block connections based on multiple criteria
 
 /* More available config tags:
- * <dualversion active="yes" show="yes" ban="yes" duration="7d" reason="Fix your client!">
+ * <allowversion value="Kiwi IRC">
+ * <allowversion value="KKK">
+ * Each tag allows one exact first VERSION reply for all connect classes.
+ * With VERSION enabled, an empty allow list rejects every first reply.
+ * <dualversion active="yes" showdual="yes" ban="yes" duration="7d" reason="Fix your client!">
  * <badversion mask="*terrible script*" reason="Your script is terrible, bye bye!">
  * <badversion mask="xchat*" ban="yes" duration="7d" reason="Time to upgrade to Hexchat!">
  * <banmissing cap="yes" version="yes" duration="14d" reason="Upgrade your client!">
@@ -80,6 +84,7 @@
 #include "timeutils.h"
 #include "clientprotocolmsg.h"
 #include "xline.h"
+#include <set>
 
 // ExtItem per User, tracking CAP request and CTCP replies
 struct UserData
@@ -93,6 +98,7 @@ struct UserData
 	bool zapped;
 	std::string firstversionreply;
 	std::string secondversionreply;
+	std::string versionblockreason;
 
 	UserData()
 		: ccblocked(false)
@@ -131,6 +137,7 @@ class ModuleConnRequire : public Module
 
 	std::vector<BadVersion> badversions;
 	std::vector<BanMissing> banmissings;
+	std::set<std::string> allowedversions;
 
 	bool dualversion;
 	bool dualshow;
@@ -237,6 +244,17 @@ class ModuleConnRequire : public Module
 			ctcpstring.clear();
 		}
 
+		decltype(allowedversions) newallowedversions;
+		for (const auto& [_, tag] : ServerInstance->Config->ConfTags("allowversion"))
+		{
+			const std::string allowedreply = tag->getString("value");
+			if (allowedreply.empty())
+				throw ModuleException(this, "Missing value in <allowversion> at " + tag->source.str());
+
+			newallowedversions.insert(allowedreply);
+		}
+		allowedversions.swap(newallowedversions);
+
 		// Rebuild the badversions vector
 		badversions.clear();
 		for (const auto& [_, itag] : ServerInstance->Config->ConfTags("badversion"))
@@ -273,18 +291,27 @@ class ModuleConnRequire : public Module
 
 	ModResult OnCheckReady(LocalUser* user) override
 	{
-		// Allow user to be held here for up to 'timeout' seconds
-		if (user->signon + timeout <= ServerInstance->Time())
-			return MOD_RES_PASSTHRU;
-
 		UserData* ud = userdata.Get(user);
 		if (!ud)
 			return MOD_RES_PASSTHRU;
 
+		const bool missingversion = !disableversion &&
+			(ud->firstversionreply.empty() || (dualversion && ud->secondversionreply.empty()));
+
+		if (user->signon + timeout <= ServerInstance->Time())
+		{
+			if (missingversion)
+			{
+				ud->ccblocked = true;
+				ServerInstance->Users.QuitUser(user, "You are not allowed to connect to this server");
+				return MOD_RES_DENY;
+			}
+
+			return MOD_RES_PASSTHRU;
+		}
+
 		// Hold while waiting for replies
-		if ((!disableversion && ud->firstversionreply.empty()) ||
-		   (dualversion && ud->secondversionreply.empty()) ||
-		   (!ctcpstring.empty() && !ud->ctcpreply))
+		if (missingversion || (!ctcpstring.empty() && !ud->ctcpreply))
 			return MOD_RES_DENY;
 
 		return MOD_RES_PASSTHRU;
@@ -317,7 +344,9 @@ class ModuleConnRequire : public Module
 			return MOD_RES_PASSTHRU;
 
 		// VERSION reply that we are expecting
-		if (!disableversion && ud->expectversion && !param.compare(1, ctcpversion.length(), ctcpversion))
+		if (!disableversion && ud->expectversion && param.back() == wrapper &&
+			!param.compare(1, ctcpversion.length(), ctcpversion) &&
+			(param.size() == len_part || (param.size() >= len_all && param[len_part - 1] == ' ')))
 		{
 			const std::string& rplversion = (param.length() > len_part ? param.substr(len_part, param.length() - len_all) : "");
 			const std::string& firstversionreply = ud->firstversionreply;
@@ -325,9 +354,18 @@ class ModuleConnRequire : public Module
 
 			ud->expectversion = false;
 
-			// Ignore empty replies
-			if (rplversion.empty())
+			if (firstversionreply.empty() && !allowedversions.count(rplversion))
+			{
+				ud->versionblockreason = rplversion.empty()
+					? "Empty first VERSION reply"
+					: "VERSION reply \"" + rplversion + "\" is not allowed";
+				ServerInstance->SNO.WriteToSnoMask('u',
+					"Blocked user {} ({}) [{}] on port {}: {}", user->GetRealMask(),
+					user->GetAddress(), user->GetRealName(), user->server_sa.port(), ud->versionblockreason);
+				ud->zapped = true;
+				ServerInstance->Users.QuitUser(user, "You are not allowed to connect to this server");
 				return MOD_RES_DENY;
+			}
 
 			// Check for a match to a configured <badversion>
 			for (std::vector<BadVersion>::const_iterator it = badversions.begin(); it != badversions.end(); ++it)
@@ -360,11 +398,12 @@ class ModuleConnRequire : public Module
 				}
 			}
 			// Second reply
-			else if (secondversionreply.empty())
-				ud->secondversionreply = rplversion;
-
-			if (dualversion && (!firstversionreply.empty() && !secondversionreply.empty() && firstversionreply != secondversionreply))
+			else if (dualversion && secondversionreply.empty())
 			{
+				ud->secondversionreply = rplversion;
+				if (firstversionreply == secondversionreply)
+					return MOD_RES_DENY;
+
 				if (dualban)
 					SetZLine(user, dualduration, dualreason, "dual");
 
@@ -375,7 +414,7 @@ class ModuleConnRequire : public Module
 					ServerInstance->SNO.WriteToSnoMask('u', "Version replies \"{}\" and \"{}\"", firstversionreply, secondversionreply);
 
 				ud->zapped = true;
-				ServerInstance->Users.QuitUser(user, dualreason);
+				ServerInstance->Users.QuitUser(user, "You are not allowed to connect to this server");
 			}
 
 			return MOD_RES_DENY;
@@ -416,10 +455,13 @@ class ModuleConnRequire : public Module
 		if (!ud)
 			return MOD_RES_PASSTHRU;
 
-		// Check class requirements against our UserData
+		// Check class requirements against our UserData.
+
 		if ((!cc->config->getBool("requirecap") || ud->sentcap) &&
-		   (disableversion || !cc->config->getBool("requireversion") || !ud->firstversionreply.empty()) &&
-		   (ctcpstring.empty() || !cc->config->getBool("requirectcp") || ud->ctcpreply))
+			(disableversion || !cc->config->getBool("requireversion") || !ud->firstversionreply.empty()) &&
+			(disableversion || !dualversion ||
+			 (!ud->secondversionreply.empty() && ud->secondversionreply == ud->firstversionreply)) &&
+			(ctcpstring.empty() || !cc->config->getBool("requirectcp") || ud->ctcpreply))
 			return MOD_RES_PASSTHRU;
 
 		ud->ccblocked = true;
@@ -511,17 +553,17 @@ class ModuleConnRequire : public Module
 		std::string buffer = "Unregistered user exiting: " + user->GetRealMask();
 		buffer.append(" (" + std::string(user->GetAddress()) + ") [" + user->GetRealName() + "]");
 		buffer.append(" on port " + ConvToStr(user->server_sa.port()));
-		buffer.append(". Possibly due to missing: ");
-		if (noCap)
-			buffer.append("CAP, ");
-		if (noRpl)
-			buffer.append(ctcpstring + " REPLY, ");
-		if (noVer)
-			buffer.append("VERSION REPLY");
+		if (!ud->versionblockreason.empty())
+			buffer.append(". " + ud->versionblockreason);
+		else if (noVer)
+			buffer.append(". Missing first VERSION reply");
+		else if (dualversion && !disableversion && ud->secondversionreply.empty())
+			buffer.append(". Missing second VERSION reply");
 
-		// Remove trailing ", " if there
-		if (buffer[buffer.length() - 1] == ' ')
-			buffer.erase(buffer.length() - 2, 2);
+		if (noCap)
+			buffer.append(". Missing CAP");
+		if (noRpl)
+			buffer.append(". Missing " + ctcpstring + " reply");
 
 		ServerInstance->SNO.WriteToSnoMask('u', buffer);
 	}
